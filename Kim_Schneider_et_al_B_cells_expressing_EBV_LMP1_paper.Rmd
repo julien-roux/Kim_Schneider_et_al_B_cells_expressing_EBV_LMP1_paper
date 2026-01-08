@@ -1,0 +1,791 @@
+---
+title: "Myelin antigen capture in the CNS by B cells expressing EBV latent membrane protein 1 leads to demyelinating lesion formation"
+author: "Julien Roux, Bioinformatics Core Facility, Departement of Biomedicine, University of Basel"
+date: "19.12.2025"
+output: 
+  html_document:
+    fig_height: 6
+    fig_width: 10
+    theme: spacelab
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+opts_chunk$set(echo = TRUE, 
+               cache.extra = rand_seed)
+```
+
+# Introduction
+
+This script reproduces the analyses presented in Kim and Schneider et al. 2026 Cell paper. The code starts from the read count matrices and associated sample and gene info files available from GEO (https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE308213), stored in the `data/` folder in this repository.
+
+# Load necessary libraries
+```{r libs, warning=FALSE, message=FALSE}
+library(tidyverse)
+## Plotting
+library(ggplot2)
+library(ggrepel)
+library(ggforce)
+library(ggpubr)
+library(RColorBrewer)
+myPalette <-  c('#e6194b', '#4363d8', '#3cb44b', '#984EA3', '#f58231', '#ffe119', '#F781BF', '#808080', '#98BFDB', '#bcf60c', '#008080', '#e6beff', '#E5C494', '#000075', '#CD00CD', '#aaffc3', '#808000', '#9a6324', '#fffac8', '#800000', '#000000', '#ffffff')
+
+## Gene annotation
+library(ensembldb)
+library(AnnotationHub)
+## Needed?
+#library(org.Mm.eg.db)
+#library(RSQLite)
+
+## Single-cell analysis
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(batchelor)
+library(bluster)
+
+## DE analysis
+library(edgeR)
+library(limma)
+
+## Trimming funciton
+trimMat <- function(x, trim=0.001) {
+    trim <- min(trim[1], 1 - trim[1])
+    lo <- quantile(x, trim, na.rm = TRUE)
+    hi <- quantile(x, 1 - trim, na.rm = TRUE)
+    x[x < lo] = lo
+    x[x > hi] = hi
+    x
+}
+```
+
+# Read-in dataset
+
+```{r readin}
+## Matrix of UMI counts for the scRNA-seq data
+tab <- read.table(file = "data/GSE286541_UMIsMatrix.txt.gz", sep = "\t", h=T)
+
+## Information on the cells
+metadata <- read.table(file = "data/GSE286541_CellMetadata.txt.gz", sep = "\t", h=T, quote = "", check.names = F)
+row.names(metadata) <- make.names(row.names(metadata))
+
+sce <- SingleCellExperiment(list(counts=as(tab, "sparseMatrix")), 
+                            colData=DataFrame(metadata, check.names = FALSE))
+
+## Information on the genes
+rowData(sce)$GENEID <- row.names(sce)
+
+ah <- AnnotationHub()
+edb <- ah[["AH113713"]] # Ensembl 110
+rowData(sce)$SYMBOL <- mapIds(edb, key=row.names(sce), keytype="GENEID", column="SYMBOL")
+rowData(sce)$DESCRIPTION <- mapIds(edb, key=row.names(sce), keytype="GENEID", column="DESCRIPTION")
+rowData(sce)$GENEBIOTYPE <- mapIds(edb, key=row.names(sce), keytype="GENEID", column="GENEBIOTYPE")
+row.names(sce) <- uniquifyFeatureNames(rowData(sce)$GENEID, rowData(sce)$SYMBOL)
+## Fill-in information manually for the constructs
+rowData(sce)[c("Ighv-MOG", "Neomycin", "Tdtomato", "Cre", "Ighv-FluBI", "Igkv-FluBI"),]$SYMBOL <- c("Ighv-MOG", "Neomycin", "Tdtomato", "Cre", "Ighv-FluBI", "Igkv-FluBI")
+rowData(sce)[c("Ighv-MOG", "Neomycin", "Tdtomato", "Cre", "Ighv-FluBI", "Igkv-FluBI"),]$GENEBIOTYPE <- c("construct")
+
+## Clean-up some of the cell metadata
+sce$Cluster <- factor(sce$Cluster)
+sce$AnnotatedCluster <- sce$Cluster
+levels(sce$AnnotatedCluster) <- c("[1] GC-like 1", "[1] GC-like 1", "[2] transitional", "[3] naïve", "[1] GC-like 1", "[4] follicular 1", "[5] myeloid-like", "[6] plasma", "[7] follicular 2", "[8] pre-B", "[9] GC-like 2")
+sce$Strain <- factor(sce$Strain, levels=c( "WT", "MOG", "FluBI" ))
+sce$`Transgenic cell` <- factor(sce$`Transgenic cell`, levels=c("Not_transgenic", "MOG", "FluBI"))
+sce$Day <- factor(sce$Day, levels=c("day7", "day21"))
+
+sce$Sample <- factor(sce$Sample, level=c("FluBI_day7.rep1", "FluBI_day7.rep2", "FluBI_day7.rep3", 
+                                         "FluBI+flu_day7.rep1", "FluBI+flu_day7.rep2", "FluBI+flu_day7.rep3", 
+                                         "FluBI_day21.rep1", "FluBI_day21.rep2", "FluBI_day21.rep3", 
+                                         "FluBI+flu_day21.rep1", "FluBI+flu_day21.rep2", "FluBI+flu_day21.rep3", 
+                                         "MOG_day7.rep1", "MOG_day7.rep2", "MOG_day7.rep3", 
+                                         "MOG_day21.rep1", "MOG_day21.rep2", "MOG_day21.rep3", 
+                                         "MOG_Brain.rep1", "MOG_Brain.rep2", "MOG_Brain.rep3", "MOG_Brain.rep4", 
+                                         "MOG_LN.rep1", "MOG_LN.rep2", 
+                                         "WT+CD40L_Brain.rep1", "WT+CD40L_Brain.rep2", "WT+CD40L_Brain.rep3", "WT+CD40L_Brain.rep4", 
+                                         "WT+CD40L_LN.rep1", "WT+CD40L_LN.rep2", "WT+CD40L_LN.rep3", "WT+CD40L_LN.rep4", 
+                                         "MOG+CD40L_Brain.rep1", "MOG+CD40L_Brain.rep2", "MOG+CD40L_Brain.rep3", "MOG+CD40L_Brain.rep4", 
+                                         "MOG+CD40L_LN.rep1", "MOG+CD40L_LN.rep2", "MOG+CD40L_LN.rep3", "MOG+CD40L_LN.rep4"))
+```
+
+# Pre-processing
+
+```{r preprocessing}
+## Normalization
+sizeFactors(sce) <- sce$`Normalization size factors`
+sce <- logNormCounts(sce, size.factors = sizeFactors(sce), center.size.factors = FALSE, name="logcounts")
+
+## QC metrics
+is.mito <- grepl("^mt-", rowData(sce)$SYMBOL)
+is.ribo <- grepl("^Rp(l|s)", rowData(sce)$SYMBOL)
+stats <- perCellQCMetrics(sce, subsets=list(MT=is.mito, 
+                                            RIBO=is.ribo), 
+                          flatten=FALSE)
+sce$scater_qc <- stats
+
+## Modelling the technical noise in gene expression, fitting a trend assuming that technical noise is poisson distributed
+set.seed(100)
+dec.pois <- modelGeneVarByPoisson(sce)
+rowData(sce)$decomposeVar <- dec.pois
+
+## Extract HVGs
+hvg.out <- getTopHVGs(rowData(sce)$decomposeVar, n=700)
+## Remove MT, Ribo genes, VDJ genes and constructs
+hvg.out <- hvg.out[!hvg.out %in% row.names(sce)[is.mito | 
+                                                  is.ribo | 
+                                                  rowData(sce)$GENEBIOTYPE %in% c("construct", "IG_C_gene", "IG_C_pseudogene", 
+                                                                                  "IG_D_gene", "IG_J_gene", "IG_LV_gene", 
+                                                                                  "IG_V_gene", "IG_V_pseudogene", "TR_C_gene", 
+                                                                                  "TR_D_gene", "TR_J_gene", "TR_J_pseudogene",
+                                                                                  "TR_V_gene", "TR_V_pseudogene")]]
+## PCA and denoising steps using the Poisson trend
+sce <- runPCA(sce, subset_row=hvg.out)
+set.seed(1000)
+sce <- denoisePCA(sce, 
+                  technical=rowData(sce)$decomposeVar, 
+                  subset.row=hvg.out)
+ncol(reducedDim(sce, "PCA")) ## 34 PCs retained
+
+## Integration across samples 
+set.seed(1234)
+mnn.out <- fastMNN(sce, 
+                   batch=sce$Sample, 
+                   k=15, 
+                   subset.row=hvg.out,
+                   BSPARAM=BiocSingular::RandomParam(deferred=TRUE))
+set.seed(1234)
+mnn.out <- runTSNE(mnn.out, 
+                   perplexity = 50, 
+                   dimred="corrected")
+
+## Add to SCE object
+reducedDim(sce, "MNN") <- reducedDim(mnn.out, "corrected")
+reducedDim(sce, "TSNE_MNN") <- reducedDim(mnn.out, "TSNE")
+## NOTE: due to package version differences, tSNE coordinates might differ from what is used in the article. The exact tSNE coordinates used in the article are available is the colData(sce) slot
+
+## Clustering
+set.seed(1234)
+clust.k5 <- clusterCells(sce, 
+                         use.dimred="MNN", 
+                         BLUSPARAM=NNGraphParam(k=5, cluster.fun=c("louvain")))
+table(clust.k5)
+## NOTE: due to package version differences, clustering might differ from what is used in the article (accessible at colData(sce)$Cluster)
+table(colData(sce)$Cluster)
+
+
+## Prepare a metadata table to be used below for some plotting
+pheno <- colData(sce)[, c("Sample", "Condition", "Condition_full", "Day", "Strain", "Tissue")] |> as_tibble() |> dplyr::distinct() |> as.data.frame()
+row.names(pheno) <- pheno$Sample
+pheno$Condition_full <- factor(pheno$Condition_full, levels=c("MOG_day7", "FluBI_day7", "FluBI+flu_day7", "MOG_day21", "FluBI_day21", "FluBI+flu_day21", "MOG_Brain", "MOG+CD40L_Brain", "WT+CD40L_Brain", "MOG_LN", "MOG+CD40L_LN", "WT+CD40L_LN"))
+pheno$Condition <- factor(pheno$Condition)
+## Reorder levels for days
+pheno$Day <- factor(pheno$Day, levels=c("day7", "day21", "day28"))
+```
+
+# Figure 3 
+
+```{r fig_3}
+myTheme1 <- theme_bw(base_size = 20) +
+  theme(panel.grid.major = element_line(colour = "lightgrey", linewidth = 0.2),
+        panel.grid.minor = element_line(colour = "lightgrey", linewidth = 0.05),
+        legend.position="right", legend.direction = "vertical",
+        legend.text=element_text(size=16),
+        axis.title=element_text(size=20),
+        axis.text=element_text(size=10),
+        panel.spacing.x = unit(1.2, "lines"),
+        axis.text.x=element_blank(),  ## Axes labels do not make much sense for tSNE plots
+        axis.ticks.x=element_blank(), 
+        axis.text.y=element_blank(), 
+        axis.ticks.y=element_blank())
+
+## Figure 3B: tSNE showing clusters, for experiment 1 only
+myDf <- data.frame(colData(sce), check.names=F)
+subset <- myDf$Condition_full %in% c("MOG_day21", "FluBI_day21", "MOG_day7", "FluBI_day7")
+f3b <- ggplot(myDf[subset, ], aes(x=`tSNE1 (MNN corrected)`, y=`tSNE2 (MNN corrected)`, colour=AnnotatedCluster)) + 
+  geom_point(size=1, alpha=0.5) +
+  scale_color_manual(name="", values=myPalette[c(2,3,4,6,7,8,9,10,11)]) +
+  guides(colour = guide_legend(override.aes = list(size=3, alpha=1), ncol=1)) +
+  myTheme1
+f3b
+
+## Figure 3C: Transgenic cells or not, split by strain and days
+ann_ellipse <- data.frame(x0 = 12, y0 = -1, a = 18, b = 11, angle = 0, Strain = factor(c("MOG"), levels=levels(sce$Strain)))
+ann_ellipse2 <- data.frame(x0 = 12, y0 = 22, a = 7, b = 10, angle = 0, Strain = factor(c("MOG"), levels=levels(sce$Strain)))
+levels(myDf$`Transgenic cell`) <- c("non-transgenic", "transgenic", "transgenic")
+
+f3c <- ggplot(myDf[subset, ], aes(x=`tSNE1 (MNN corrected)`, y=`tSNE2 (MNN corrected)`,
+                                 colour=`Transgenic cell`, size=`Transgenic cell`, alpha=`Transgenic cell`)) + 
+  geom_point() +
+  geom_ellipse(data=ann_ellipse, inherit.aes = FALSE, 
+               aes(x0 = x0, y0 = y0, a = a, b = b, angle = angle), 
+               colour="maroon1", linewidth = 1.5, show.legend=FALSE) +
+  geom_ellipse(data=ann_ellipse2, inherit.aes = FALSE, 
+               aes(x0 = x0, y0 = y0, a = a, b = b, angle = angle), 
+               colour="goldenrod1", linewidth = 1.5, show.legend=FALSE) +
+  scale_color_manual(name="", values=myPalette[c(2,1,3)]) +
+  scale_size_manual(name="", values=c(0.6,1,0)) +
+  scale_alpha_manual(name="", values=c(0.5, 0.8,0)) +
+  facet_grid(vars(Day), vars(Strain)) +
+  guides(colour = guide_legend(override.aes = list(size=4, alpha=1), nrow=1)) +
+  myTheme1 + 
+  theme(strip.background = element_blank(),
+        legend.position="bottom")
+f3c
+
+
+## Figure 3D: Abundance plot
+subset <- myDf$Condition_full %in% c("MOG_day21", "FluBI_day21", "MOG_day7", "FluBI_day7")
+counts <- table(factor(sce$`Transgenic cell`[subset]), factor(sce$Sample[subset]))
+myDf2 <- as.data.frame(counts)
+colnames(myDf2) <- c("Transgenic cell", "Sample", "Count")
+## Add condition information
+myDf2$Condition_full <- pheno[as.character(myDf2$Sample), ]$Condition_full
+myDf2$Condition <-  pheno[as.character(myDf2$Sample), ]$Condition
+myDf2$Day <- factor(pheno[as.character(myDf2$Sample), ]$Day, levels=c("day7", "day21"))
+myDf2$Strain <- factor(pheno[as.character(myDf2$Sample), ]$Strain)
+levels(myDf2$`Transgenic cell`) <- c("non-transgenic", "transgenic", "transgenic")
+## Remove rows with 0 counts
+myDf2 <- myDf2[myDf2$Count != 0, ]
+
+myTheme2 <- theme_bw(base_size = 20) +
+  theme(strip.background = element_blank(),
+        panel.grid.major = element_line(colour = "lightgrey", linewidth = 0.2),
+        panel.grid.minor = element_line(colour = "lightgrey", linewidth = 0.05),
+        legend.position="bottom", legend.direction = "horizontal",
+        axis.title=element_text(size=20),
+        axis.text.y = element_text(size=12, angle = 90, hjust = 0.5, vjust = 0),
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        panel.spacing.x = unit(1.2, "lines"),
+        legend.title=element_blank())
+f3d <- ggplot(myDf2, aes(x=`Transgenic cell`, y=Count, color=`Transgenic cell`, shape=`Transgenic cell`)) + 
+  ylab("Cell count") +
+  xlab("") +
+  geom_point(size=4, position=position_jitterdodge(jitter.width = 0.2,
+                                                   dodge.width = 0.5,
+                                                   seed = 1234)) + 
+  stat_summary(geom = "point", 
+               fun = "mean", 
+               size = 10, col = "black", shape = "-") + 
+  facet_grid(vars(Day), vars(Strain)) +
+  scale_color_manual(name="", values=myPalette[c(2,1)]) +
+  scale_shape_manual(name="", values=c(16,17)) +
+  scale_y_continuous(trans = 'log10') +
+  myTheme2
+f3d
+
+## Statistical testing
+transgenic <- sce$`Transgenic cell`
+levels(transgenic) <- c("Not_transgenic", "Transgenic", "Transgenic")
+counts <- table(transgenic[subset], factor(sce$Sample[subset]))
+counts <- matrix(counts, ncol = ncol(counts), nrow=nrow(counts), dimnames = list(row.names(counts), colnames(counts)))
+y.ab <- DGEList(counts, samples= data.frame(row.names = colnames(counts),
+                                            Condition = factor(gsub("(.+)\\.rep\\d", "\\1", colnames(counts)))))
+design <- model.matrix(~ 0 + Condition, data = y.ab$samples)
+colnames(design) <- gsub("Condition", "", colnames(design))
+y.ab <- estimateDisp(y.ab, design, trend="none")
+fit.ab <- glmQLFit(y.ab, design, robust=FALSE, abundance.trend=FALSE, legacy = TRUE)
+
+contrasts.matrix <- makeContrasts(
+  day7   = MOG_day7 - FluBI_day7,
+  day21  = MOG_day21 - FluBI_day21,
+  MOG    = MOG_day21 - MOG_day7,
+  FluBI  = FluBI_day21 - FluBI_day7,
+  levels=design
+)
+for (i in 1:ncol(contrasts.matrix)) {
+  contr.name <- colnames(contrasts.matrix)[i]
+  message("Contrast ", contr.name)
+  
+  res <- glmQLFTest(fit.ab, contrast=contrasts.matrix[, contr.name])
+  print(top <- topTags(res, n=10))
+}
+
+
+## Figure 3E: AICD signature in transgenic cells
+## This is based on this paper: Münchhalfen et al. https://www.nature.com/articles/s41467-024-51166-3, the processed data are downloaded from GEO
+system("wget https://ftp.ncbi.nlm.nih.gov/geo/series/GSE237nnn/GSE237799/suppl/GSE237799_kallisto_normalized_abundances.tsv.gz -P data/")
+tab_full <- read.table("data/GSE237799_kallisto_normalized_abundances.tsv.gz", h=T, sep="\t", check.names=F)
+tab <- tidyr::pivot_wider(data = tab_full[, 1:3], names_from = "sample", values_from = "est_counts")
+## parse last part of Gencode ID
+tab$target_id <- gsub("\\.\\d+$", "", tab$target_id)
+transcripts.gr <- unlist(transcriptsBy(edb, by = "gene"))
+## Sum counts of transcript matching to same ensembl
+tx2gene <- data.frame(transcripts.gr$tx_id, transcripts.gr$gene_id)
+row.names(tx2gene) <- transcripts.gr$tx_id
+tab <- tab[!is.na(tx2gene[tab$target_id, ]$transcripts.gr.gene_id), ]
+tab <- rowsum(tab[, -1], group = tx2gene[tab$target_id, ]$transcripts.gr.gene_id)
+
+## Pheno data 
+pheno_GSE237799 <- tab_full[, c("sample", "genotype", "celltype", "group", "batch")] |> as_tibble() |> dplyr::distinct() |> as.data.frame()
+row.names(pheno_GSE237799) <- pheno_GSE237799$sample
+dgel <- DGEList(counts = tab, 
+                samples = pheno_GSE237799)
+keep <- rowSums(edgeR::cpm(dgel) > 1) >= 2 # arbitrary threshold 
+dgel <- dgel[keep, ]
+dgel <- edgeR::calcNormFactors(dgel)
+dgel$genes$SYMBOL <- mapIds(edb, key=row.names(dgel), keytype="GENEID", column="SYMBOL")
+## Subset to GC samples
+dgel <- dgel[, dgel$samples$celltype == "gcB_cells"]
+## design matrix 
+moma <- model.matrix(~ 0 + genotype + batch, data=dgel$samples)
+colnames(moma) <- gsub("genotype", "", colnames(moma)) 
+## Contrast matrix
+contrasts.matrix <- makeContrasts(
+  KO_vs_WT = KO - WT,
+  levels=moma
+)
+v <- voom(dgel, moma, plot=FALSE, normalize.method = "cyclicloess")
+fit <- lmFit(v, moma)
+fit2 <- contrasts.fit(fit, contrasts.matrix)
+fit2 <- eBayes(fit2, robust=TRUE) 
+# apply(de <- decideTests(fit2, p.value = 0.05), 2, table)
+top <- topTable(fit2, coef=1, p.value=1, n=Inf, sort.by = "P")
+## Select signature genes, significantly down-regulated with log2FC larger than 1
+down_in_gc <- row.names(top)[top$adj.P.Val < 0.01 & top$logFC < -1] 
+## if people want to load this signature directly:
+# down_in_gc <- c("ENSMUSG00000035095", "ENSMUSG00000041000", "ENSMUSG00000029919",                 "ENSMUSG00000023990", "ENSMUSG00000045625", "ENSMUSG00000058447",                 "ENSMUSG00000022265", "ENSMUSG00000041323", "ENSMUSG00000028184",                 "ENSMUSG00000021190", "ENSMUSG00000086040", "ENSMUSG00000112241",                 "ENSMUSG00000029275", "ENSMUSG00000034271", "ENSMUSG00000028664",                 "ENSMUSG00000030134", "ENSMUSG00000030208", "ENSMUSG00000039063",                 "ENSMUSG00000021728", "ENSMUSG00000036611", "ENSMUSG00000018509",                 "ENSMUSG00000041444", "ENSMUSG00000027111", "ENSMUSG00000047881",                 "ENSMUSG00000020566", "ENSMUSG00000024885", "ENSMUSG00000034295",                 "ENSMUSG00000025330", "ENSMUSG00000038963", "ENSMUSG00000027221",                 "ENSMUSG00000030772", "ENSMUSG00000021136", "ENSMUSG00000035342",                 "ENSMUSG00000078815", "ENSMUSG00000020262", "ENSMUSG00000011148",                 "ENSMUSG00000031504", "ENSMUSG00000006930", "ENSMUSG00000021796",                 "ENSMUSG00000031078", "ENSMUSG00000064264", "ENSMUSG00000023079",                 "ENSMUSG00000003526", "ENSMUSG00000025856", "ENSMUSG00000032261",                 "ENSMUSG00000002985", "ENSMUSG00000034573")
+
+myScore <-rowMeans(apply(logcounts(sce)[rowData(sce)$GENEID %in% down_in_gc, ], 1, 
+                                    function(x){ r <- range(x); return((x - r[1])/(r[2] - r[1]))}), na.rm=T)
+myDf$`TFEB signature` <- trimMat(myScore)
+
+subset <- myDf$Condition_full %in% c("MOG_day21", "FluBI_day21", "MOG_day7", "FluBI_day7") & 
+  myDf$`Transgenic cell` == "transgenic"
+myDf3 <- myDf[subset,]
+myDf3 <- myDf3[order(myDf3$`TFEB signature`), ]
+f3e <- ggplot(myDf3, aes(x=`tSNE1 (MNN corrected)`, y=`tSNE2 (MNN corrected)`, 
+                        colour=`TFEB signature`,
+                        size=`TFEB signature` ,
+                        alpha=`TFEB signature` )) +
+  geom_point() +
+  geom_ellipse(data=ann_ellipse, inherit.aes = FALSE, 
+               aes(x0 = x0, y0 = y0, a = a, b = b, angle = angle), 
+               colour="maroon1", linewidth = 1.5, show.legend=FALSE) +
+  scale_colour_gradient(name="",
+                        low = brewer.pal(9, "Blues")[2],
+                        high = brewer.pal(9, "Blues")[9],
+                        guide = guide_colourbar(title.position = "left")) +
+  scale_size(range = c(0.5, 2)) +
+  scale_alpha(range = c(0.4, 0.8)) +
+  facet_grid(vars(Day), vars(Strain)) +
+  myTheme1 +
+  guides(size="none", 
+         alpha="none") +
+  theme(strip.background = element_blank()) 
+f3e
+
+## Figure 3F: activation signature in transgenic cells
+## This signature is obtained from the analysis of our bulk RNA-seq experiment: genes most up-regulated in MOG-stimulated vs. naive 
+signature_activation <- c("ENSMUSG00000000982", "ENSMUSG00000018930", "ENSMUSG00000021822", "ENSMUSG00000037211", "ENSMUSG00000026358", "ENSMUSG00000022018", "ENSMUSG00000024912", "ENSMUSG00000042842", "ENSMUSG00000028655", "ENSMUSG00000030268", "ENSMUSG00000016239", "ENSMUSG00000037868", "ENSMUSG00000027533", "ENSMUSG00000029304", "ENSMUSG00000053310", "ENSMUSG00000026826", "ENSMUSG00000021838", "ENSMUSG00000028341", "ENSMUSG00000043099", "ENSMUSG00000022346", "ENSMUSG00000029135", "ENSMUSG00000044468", "ENSMUSG00000017639", "ENSMUSG00000029275", "ENSMUSG00000024533", "ENSMUSG00000037907", "ENSMUSG00000020656", "ENSMUSG00000098998", "ENSMUSG00000035164", "ENSMUSG00000020534", "ENSMUSG00000019256", "ENSMUSG00000024891", "ENSMUSG00000018428", "ENSMUSG00000065397", "ENSMUSG00000003882", "ENSMUSG00000032724", "ENSMUSG00000027171", "ENSMUSG00000028937", "ENSMUSG00000067586", "ENSMUSG00000028392", "ENSMUSG00000032902", "ENSMUSG00000039395", "ENSMUSG00000006442", "ENSMUSG00000028542", "ENSMUSG00000020396", "ENSMUSG00000004267", "ENSMUSG00000020089", "ENSMUSG00000006445", "ENSMUSG00000028641", "ENSMUSG00000043439", "ENSMUSG00000042622", "ENSMUSG00000041774", "ENSMUSG00000024640", "ENSMUSG00000024737", "ENSMUSG00000037278", "ENSMUSG00000058392", "ENSMUSG00000033450", "ENSMUSG00000026770", "ENSMUSG00000031788", "ENSMUSG00000038550", "ENSMUSG00000026475", "ENSMUSG00000028970", "ENSMUSG00000022996", "ENSMUSG00000006310", "ENSMUSG00000020101", "ENSMUSG00000097418", "ENSMUSG00000023951", "ENSMUSG00000028680", "ENSMUSG00000023915", "ENSMUSG00000030189", "ENSMUSG00000024401", "ENSMUSG00000023942", "ENSMUSG00000026603", "ENSMUSG00000034424", "ENSMUSG00000028207", "ENSMUSG00000026981", "ENSMUSG00000042377", "ENSMUSG00000093782", "ENSMUSG00000115219", "ENSMUSG00000001436", "ENSMUSG00000026646", "ENSMUSG00000030852", "ENSMUSG00000004929", "ENSMUSG00000097039", "ENSMUSG00000091952", "ENSMUSG00000053553", "ENSMUSG00000000628", "ENSMUSG00000075511", "ENSMUSG00000006641", "ENSMUSG00000035355", "ENSMUSG00000000934", "ENSMUSG00000083669", "ENSMUSG00000084883", "ENSMUSG00000000184", "ENSMUSG00000047945", "ENSMUSG00000021356", "ENSMUSG00000079442", "ENSMUSG00000107092", "ENSMUSG00000021175", "ENSMUSG00000036902", "ENSMUSG00000022797", "ENSMUSG00000015176", "ENSMUSG00000027076", "ENSMUSG00000000531", "ENSMUSG00000023206", "ENSMUSG00000032020", "ENSMUSG00000047649", "ENSMUSG00000032788", "ENSMUSG00000034173", "ENSMUSG00000033307", "ENSMUSG00000029591", "ENSMUSG00000001056", "ENSMUSG00000036499", "ENSMUSG00000023034", "ENSMUSG00000045763", "ENSMUSG00000020644", "ENSMUSG00000028071", "ENSMUSG00000058809", "ENSMUSG00000002308", "ENSMUSG00000041506", "ENSMUSG00000039682", "ENSMUSG00000022636", "ENSMUSG00000047509", "ENSMUSG00000089809")
+## NOTE: see below the code used to obtain this signature of 124 genes (Figure S2D)
+
+## Average signature score
+myScore <- rowMeans(apply(logcounts(sce)[rowData(sce)$GENEID %in% signature_activation, ], 1, 
+                                    function(x){ r <- range(x); return((x - r[1])/(r[2] - r[1]))}))
+## Trimming extreme values for better color dynamics
+myDf$`activation signature` <- trimMat(myScore)
+subset <- myDf$Condition_full %in% c("MOG_day21", "FluBI_day21", "MOG_day7", "FluBI_day7") & 
+  myDf$`Transgenic cell` == "transgenic"
+myDf3 <- myDf[subset,]
+myDf3 <- myDf3[order(myDf3$`activation signature`), ]
+f3f <- ggplot(myDf3, aes(x=`tSNE1 (MNN corrected)`, y=`tSNE2 (MNN corrected)`, 
+                        colour=`activation signature`,
+                        size=`activation signature`,
+                        alpha=`activation signature`)) +
+  geom_point() +
+  geom_ellipse(data=ann_ellipse, inherit.aes = FALSE, 
+               aes(x0 = x0, y0 = y0, a = a, b = b, angle = angle), 
+               colour="maroon1", linewidth = 1.5, show.legend=FALSE) +
+  scale_colour_gradient(name="",
+                        low = brewer.pal(9, "Blues")[2],
+                        high = brewer.pal(9, "Blues")[9],
+                        guide = guide_colourbar(title.position = "left")) +
+  scale_size(range = c(0.5, 2)) +
+  scale_alpha(range = c(0.4, 0.8)) +
+  facet_grid(vars(Day), vars(Strain)) +
+  guides(size="none", 
+         alpha="none") +
+  myTheme1 +
+  theme(strip.background = element_blank()) 
+f3f
+```
+
+# Figure 4
+```{r fig_4}
+## Figure 4F: tSNE showing clusters, for experiment 2 only
+subset <- myDf$Experiment == 2
+f4f <- ggplot(myDf[subset, ], aes(x=`tSNE1 (MNN corrected)`, y=`tSNE2 (MNN corrected)`, colour=AnnotatedCluster)) + 
+  geom_point(size=1, alpha=0.5) +
+  scale_color_manual(name="", values=myPalette[c(2,3,4,6,7,8,9,10,11)]) +
+  guides(colour = guide_legend(override.aes = list(size=3, alpha=1), ncol=1)) +
+  myTheme1
+f4f
+
+## Figure 4G: transgenic cells or not, split by condition, brain only
+myDf3 <- myDf[myDf$Experiment == 2 & myDf$Tissue == "Brain", ]
+myDf3 <- myDf3[order(myDf3$`Transgenic cell`), ]
+myDf3$Condition <- factor(myDf3$Condition)
+levels(myDf3$Condition)[1] <- "MOG w/o CD40L"
+f4g <- ggplot(myDf3, aes(x=`tSNE1 (MNN corrected)`, y=`tSNE2 (MNN corrected)`, colour=`Transgenic cell`, size=`Transgenic cell`, alpha=`Transgenic cell`)) + 
+  geom_point() +
+  geom_ellipse(data=ann_ellipse[, 1:5], inherit.aes = FALSE, 
+               aes(x0 = x0, y0 = y0, a = a, b = b, angle = angle), 
+               colour="maroon1", linewidth = 1.5, show.legend=FALSE) +
+  scale_color_manual(name="", values=myPalette[c(2,1)]) +
+  scale_size_manual(name="", values=c(0.6,1)) +
+  scale_alpha_manual(name="", values=c(0.5, 0.8)) +
+  facet_grid(cols = vars(Condition)) +
+  guides(colour = guide_legend(override.aes = list(size=4, alpha=1), nrow=1)) +
+  myTheme1 +
+  theme(strip.background = element_blank(),
+        legend.position="bottom"
+) 
+f4g
+
+
+## Figure 4H: abundance plots
+subset <- sce$Experiment == 2 & 
+  sce$`Transgenic cell` == "MOG" &
+  !sce$Condition_full %in%  c("WT+CD40L_Brain", "WT+CD40L_LN") ## Remove WT strain samples
+props <- table(sce$AnnotatedCluster[subset], sce$Sample[subset])
+props <- prop.table(props, margin = 2) * 100
+myDf2 <- as.data.frame(props)
+colnames(myDf2) <- c("AnnotatedCluster", "Sample", "Frequency")
+myDf2$Condition_full <- pheno[as.character(myDf2$Sample), ]$Condition_full
+myDf2$Condition <-  pheno[as.character(myDf2$Sample), ]$Condition
+myDf2 <- myDf2[!is.na(myDf2$Frequency), ]
+myDf2$Condition_full <- factor(myDf2$Condition_full)
+## keep Brain only
+myDf2 <- myDf2[myDf2$Condition_full %in% c("MOG_Brain", "MOG+CD40L_Brain"),]
+levels(myDf2$Condition)[3] <- "MOG w/o CD40L"
+
+f4h <- ggplot(myDf2, aes(x=Condition, y=Frequency, colour=Condition, shape=Condition)) + 
+  ylab("Frequency [%]") +
+  xlab("") +
+  ylim(0, NA) + 
+  geom_point(size=4, 
+             position=position_jitterdodge(jitter.width = 0.8,
+                                           dodge.width = 0.5,
+                                           seed = 1234)) + 
+  stat_summary(geom = "point", 
+               fun = "mean", 
+               size = 10, col = "black", shape = "-") + 
+  facet_wrap( ~ AnnotatedCluster, scales="free_y", nrow=1) + #, strip.position="bottom") +
+  scale_color_manual(values=myPalette[3:4]) +
+  myTheme2 + 
+  guides(colour = guide_legend(override.aes = list(size=4, alpha=1, linetype=0), 
+                               nrow=1))
+f4h
+
+## Statistical testing
+counts <- table(factor(sce$AnnotatedCluster[subset]), factor(sce$Sample[subset]))
+counts <- matrix(counts, ncol = ncol(counts), nrow=nrow(counts), dimnames = list(row.names(counts), colnames(counts)))
+y.ab <- DGEList(counts, samples= data.frame(row.names = colnames(counts),
+                                            Condition = factor(pheno[gsub("(.+rep\\d)_.+", "\\1", colnames(counts)), ]$Condition_full)))
+design <- model.matrix(~ 0 + Condition, data = y.ab$samples)
+colnames(design) <- gsub("Condition", "", colnames(design))
+colnames(design) <- make.names(colnames(design)) 
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE, legacy = TRUE)
+contrasts.matrix <- makeContrasts(
+  Effect_of_CD40L   = MOG.CD40L_Brain - MOG_Brain,
+  levels=design
+)
+for (i in 1:ncol(contrasts.matrix)) {
+  contr.name <- colnames(contrasts.matrix)[i]
+  message("Contrast ", contr.name)
+  
+  res <- glmQLFTest(fit.ab, contrast=contrasts.matrix[, contr.name])
+  print(top <- topTags(res, n=10))
+}
+
+
+## Figure 4I: CD40 and MHCII expression across transgenic cells
+## Violin plot of expression across clusters
+plotExpression(sce[, sce$Experiment == 2 & sce$`Transgenic cell` == "MOG"], features="Cd40", 
+               exprs_values = "logcounts", 
+               x="Cluster", colour_by="AnnotatedCluster") + 
+  scale_color_manual(name="", values=myPalette[c(2,3,4,6,7,9,10,11)]) +
+  myTheme1
+plotExpression(sce[, sce$Experiment == 2 & sce$`Transgenic cell` == "MOG"], features="H2-Ab1", 
+               exprs_values = "logcounts", 
+               x="Cluster", colour_by="AnnotatedCluster") + 
+  scale_color_manual(name="", values=myPalette[c(2,3,4,6,7,9,10,11)]) +
+  myTheme1
+```
+
+# Figure 5 
+```{r fig_5}
+tab <- read.table(file = "data/GSE308407_Counts_Table.tsv.gz", sep = "\t", h=T, check.names = FALSE)
+
+dge2 <- DGEList(counts = tab, 
+                genes = data.frame(GENEID = row.names(tab)))
+
+## Replicate info
+dge2$samples$Mouse <- strsplit2(colnames(dge2), split = "-")[,2 ]
+## The LMP-1-expressing/MOG-specific B cells come from 3 different mice, let's rename them for clarity
+dge2$samples$Mouse[dge2$samples$Mouse == "MI" & strsplit2(colnames(dge2), split = "-")[,3 ] == "L"] <- "MIV"
+dge2$samples$Mouse[dge2$samples$Mouse == "MII" & strsplit2(colnames(dge2), split = "-")[,3 ] == "L"] <- "MV"
+dge2$samples$Mouse[dge2$samples$Mouse == "MIII" & strsplit2(colnames(dge2), split = "-")[,3 ] == "L"] <- "MVI"
+dge2$samples$Mouse <- factor(dge2$samples$Mouse)
+
+## Conditions
+dge2$samples$Stimulation <- factor(strsplit2(colnames(dge2), split = "-")[,1 ])
+levels(dge2$samples$Stimulation) <- c("naive", "naive", "MOG_stimulated", "MOG_stimulated")
+dge2$samples$Timepoint <- factor(strsplit2(colnames(dge2), split = "-")[,1 ])
+levels(dge2$samples$Timepoint) <- c("24h", "4h", "24h", "4h")
+dge2$samples$Timepoint <- relevel(dge2$samples$Timepoint, ref = "4h")
+dge2$samples$Costimulation <- factor(strsplit2(colnames(dge2), split = "-")[,3 ])
+levels(dge2$samples$Costimulation) <- c("none", "CD40L", "LMP1", "Costimulation_Tcells")
+## Combine these 3 variables 
+dge2$samples$group <- factor(paste0(dge2$samples$Stimulation, ".", dge2$samples$Costimulation, ".", dge2$samples$Timepoint))
+
+## Information on the genes
+edb3 <- ah[["AH116909"]] ## Ensembl 112 was used
+dge2$genes$SYMBOL <- mapIds(edb3, key=dge2$genes$GENEID, keytype="GENEID", column="SYMBOL")
+dge2$genes$DESCRIPTION <- mapIds(edb3, key=dge2$genes$GENEID, keytype="GENEID", column="DESCRIPTION")
+dge2$genes$GENEBIOTYPE <- mapIds(edb3, key=dge2$genes$GENEID, keytype="GENEID", column="GENEBIOTYPE")
+
+## Limma-voom DE analysis
+moma <- model.matrix(~ 0 + group, data=dge2$samples) 
+colnames(moma) <- gsub("group", "", colnames(moma)) 
+
+## Contrast matrix
+contrasts.matrix <- makeContrasts(
+  MOG_stimulated_vs_naive_in_LMP1_24h = MOG_stimulated.LMP1.24h - naive.LMP1.24h,
+  MOG_stimulated_vs_naive_in_CD40L_24h = MOG_stimulated.CD40L.24h - naive.CD40L.24h,
+  LMP1_vs_CD40L_in_stimulated_vs_unstimulated_24h = (MOG_stimulated.LMP1.24h - MOG_stimulated.CD40L.24h) - (naive.LMP1.24h - naive.CD40L.24h), ## Interaction term
+  levels=moma
+)
+
+fit <- voomLmFit(dge2, 
+                 design = moma, 
+                 block = dge2$samples$Mouse, 
+                 sample.weights = TRUE, 
+                 normalize.method = "cyclicloess",
+                 plot = FALSE)
+fit3 <- contrasts.fit(fit, contrasts.matrix)
+fit3 <- eBayes(fit3)
+
+top.x <- topTable(fit3, coef="MOG_stimulated_vs_naive_in_CD40L_24h", n=Inf, sort.by = "P")
+top.y <- topTable(fit3, coef="MOG_stimulated_vs_naive_in_LMP1_24h", n=Inf, sort.by = "P")
+myDf <- merge(top.x, top.y, by="GENEID") 
+myDf$signif <- FALSE
+myDf$signif[myDf$adj.P.Val.x < 0.05 & myDf$adj.P.Val.y < 0.05 & myDf$logFC.x > 0 & myDf$logFC.y > 0] <- "Up"
+myDf$signif[myDf$adj.P.Val.x < 0.05 & myDf$adj.P.Val.y < 0.05 & myDf$logFC.x < 0 & myDf$logFC.y < 0] <- "Down"
+myDf$signif <- factor(myDf$signif, levels=c("Up", "Down", FALSE))
+table(myDf$signif)
+myDf <- myDf[order(myDf$signif, decreasing = T), ]
+myDf$SYMBOL <- myDf$SYMBOL.x
+myDf$SYMBOL[myDf$signif == "FALSE"] <- ""
+## Gene significant for the interaction
+myDf$SYMBOL[myDf$SYMBOL.x == "Tmem123"] <- "Tmem123"
+
+myTheme3 <- theme_bw(base_size = 20) +
+  theme(panel.grid.major = element_line(colour = "lightgrey", linewidth = 0.2), 
+        panel.grid.minor = element_line(colour = "lightgrey", linewidth = 0.05), 
+        legend.position="right", 
+        legend.direction = "vertical",
+        axis.text=element_text(size=20), axis.title=element_text(size=20))
+
+f5c <- ggplot(myDf, 
+            aes(x=logFC.x, y=logFC.y, color=signif)) + 
+  xlab("MOG-stimulated (24h) vs. naive in CD40L") +
+  ylab("MOG-stimulated (24h) vs. naive in LMP1") +
+  geom_point() +
+  geom_point(data=myDf[myDf$SYMBOL == "Tmem123", ], aes(x=logFC.x, y=logFC.y), colour="orange") +
+  geom_density_2d(col="grey30") +
+  geom_abline(slope=1, intercept=0, linewidth = 1, color="grey60") +
+  stat_cor(method = "pearson", color="black", size=7, hjust=0) +
+  geom_text_repel(data=myDf[myDf$SYMBOL != "", ], 
+                  aes(x=logFC.x,
+                      y=logFC.y,
+                      label=SYMBOL),
+                  segment.color = "black", color="black",
+                  point.padding = 0.1, 
+                  box.padding=0.1,
+                  max.overlaps = 10, 
+                  force = 10) +
+  scale_color_manual(name="",  
+                     limits=c("Up", "Down"), 
+                     values=unname(c(myPalette[1], myPalette[2], myPalette[5])),
+                     na.value = "grey80") +
+  scale_alpha_manual(values=c(1,1,0.6), guide="none") +
+  guides(colour = guide_legend(override.aes = list(size=4, alpha=1), nrow=1,
+                               direction = "horizontal", position = "bottom")) +
+  myTheme3
+f5c
+```
+
+# Figure S2D
+
+```{r fig_s2}
+tab <- read.table(file = "data/GSE308212_Counts_Table.tsv.gz", sep = "\t", h=T)
+
+dge1 <- DGEList(counts = tab,
+                group = factor(gsub("M.+\\.(.+)", "\\1", colnames(tab))), 
+                genes = data.frame(GENEID = row.names(tab)))
+## Rename levels for group
+levels(dge1$samples$group) <- c("naive", "IgM_stimulated", "MOG_stimulated")
+## Replicate info
+dge1$samples$Mouse <- factor(gsub("(M.+)\\..+", "\\1", colnames(dge1)))
+
+## Information on the genes
+edb2 <- ah[["AH89211"]] ## Ensembl 102 was used
+dge1$genes$SYMBOL <- mapIds(edb2, key=dge1$genes$GENEID, keytype="GENEID", column="SYMBOL")
+dge1$genes$DESCRIPTION <- mapIds(edb2, key=dge1$genes$GENEID, keytype="GENEID", column="DESCRIPTION")
+dge1$genes$GENEBIOTYPE <- mapIds(edb2, key=dge1$genes$GENEID, keytype="GENEID", column="GENEBIOTYPE")
+
+## Limma-voom DE analysis
+
+moma <- model.matrix(~ 0 + group + Mouse, data=dge1$samples) 
+colnames(moma) <- gsub("group", "", colnames(moma)) 
+contrasts.matrix <- makeContrasts(
+  MOG_vs_IgM = MOG_stimulated - IgM_stimulated,
+  MOG_vs_naive = MOG_stimulated - naive, 
+  IgM_vs_naive = IgM_stimulated - naive,
+  levels=moma
+)
+
+v <- voomWithQualityWeights(dge1, moma, plot=TRUE, normalize.method = "cyclicloess")
+fit <- lmFit(v, moma)
+fit2 <- contrasts.fit(fit, contrasts.matrix)
+fit2 <- eBayes(fit2)
+
+## Extract the 124 genes used as activation signature in Figure 3
+top <- topTable(fit2, coef="MOG_vs_naive", n=Inf, sort.by = "P")
+top <- top[top$logFC > 2, ]
+top <- top[order(top$logFC, decreasing = T), ]
+signature_activation <- row.names(top)
+
+## Figure S2D: IgM vs naive / MOG vs. naive
+top.x <- topTable(fit2, coef="MOG_vs_naive", n=Inf, sort.by = "P")
+top.y <- topTable(fit2, coef="IgM_vs_naive", n=Inf, sort.by = "P")
+myDf <- merge(top.x, top.y, by="GENEID") 
+## Color if both contrasts are significant 
+myDf$signif <- FALSE
+myDf$signif[myDf$adj.P.Val.x < 0.05 & myDf$adj.P.Val.y < 0.05 & myDf$logFC.x > 0 & myDf$logFC.y > 0] <- "Up"
+myDf$signif[myDf$adj.P.Val.x < 0.05 & myDf$adj.P.Val.y < 0.05 & myDf$logFC.x < 0 & myDf$logFC.y < 0] <- "Down"
+myDf$signif <- factor(myDf$signif, levels=c("Up", "Down", FALSE))
+myDf <- myDf[order(myDf$signif, decreasing = T), ]
+## Symbols to plot
+myDf$SYMBOL <- myDf$SYMBOL.x
+myDf$SYMBOL[myDf$signif == "FALSE"] <- ""
+## Only label genes with large fold change
+to_label <- myDf$signif != "FALSE" & (abs(myDf$logFC.x) > 3.5 | abs(myDf$logFC.y) > 3.5)
+
+fs2d <- ggplot(myDf, 
+               aes(x=logFC.x, y=logFC.y, color=signif)) + 
+  xlab("MOG-stimulated vs. naive") +
+  ylab("IgM-stimulated vs. naive") +
+  xlim(c(-7.4, 7.4)) + 
+  ylim(c(-5.2, 5.2)) +
+  geom_point(size=1, alpha=0.8) +
+  geom_density_2d(col="grey30", linewidth = 0.5) +
+  geom_abline(slope=1, intercept=0, linewidth = 1, color="grey60") +
+  stat_cor(method = "pearson", color="black", size=7, hjust=0) +
+  geom_text_repel(data=myDf[to_label, ], 
+                  aes(x=logFC.x,
+                      y=logFC.y,
+                      label=SYMBOL),
+                  segment.color = "black", color="black",
+                  point.padding = 0.1,
+                  box.padding = 0.1,
+                  max.overlaps = Inf) +
+  scale_color_manual(name="",  
+                     limits=c("Up", "Down"), 
+                     values=unname(c(myPalette[1], myPalette[2])),
+                     na.value = "grey80") +
+  scale_alpha_manual(values=c(1,1,0.6), guide="none") +
+  guides(colour = guide_legend(override.aes = list(size=4, alpha=1), nrow=1,
+                               direction = "horizontal", position = "bottom")) +
+  myTheme3
+fs2d
+```
+
+
+# Figure S4
+Heatmaps of best cluster-markers in the scRNA-seq dataset
+
+```{r fig_s4}
+marker.info <- scoreMarkers(sce,                          
+                            groups=sce$Cluster,
+                            block=sce$Sample)
+## Remove Rp and mt genes and return the top 10 genes per cluster (sorted by AUC)
+top.markers <- unique(unlist(lapply(marker.info, function(x){
+ top.markers.cluster <- x[!grepl("^Rp|^mt-", row.names(x)), ]
+ return(row.names(top.markers.cluster[order(top.markers.cluster$mean.AUC,  decreasing=TRUE), ][1:10,]))
+})))
+sort(top.markers)
+
+## Average expression across cells from same sample and cluster
+splitCells <- split(colnames(sce), paste0(sce$Cluster, ".", sce$Sample))
+## Filter when less than 10 cells
+splitCells <- splitCells[sapply(splitCells, length) >= 10]
+ave_by_cluster <- vapply(splitCells, function(x){ Matrix::rowMeans(logcounts(sce)[, x]) }, numeric(nrow(logcounts(sce))))
+colnames(ave_by_cluster) <- paste0("ave.expr.cluster", colnames(ave_by_cluster))
+rowData(sce)$ave_by_cluster_sample <- DataFrame(ave_by_cluster)
+
+
+## Draw heatmaps
+heat.vals <- as.matrix(rowData(sce)$ave_by_cluster_sample[top.markers,])
+## remove sample-specific effects for visualization (since we corrected fro this using fastMNN integration)
+heat.vals <- removeBatchEffect(heat.vals, batch=gsub("ave\\.expr\\.cluster\\d{1,2}\\.(.+)", "\\1", colnames(heat.vals)))
+
+## Figure S4A: Experiment 1
+heat.vals2 <- heat.vals[, pheno[gsub("ave\\.expr\\.cluster\\d{1,2}\\.(.+)", "\\1", colnames(heat.vals)), "Condition_full"] %in% c("MOG_day7", "FluBI_day7", "MOG_day21", "FluBI_day21")]
+## Center and scale values
+heat.vals2 <- (heat.vals2 - Matrix::rowMeans(heat.vals2)) / (apply(heat.vals2, 1, max) - apply(heat.vals2, 1, min))
+## reorder columns by Cluster/condition in logical order
+heat.vals2 <- heat.vals2[, order(factor(gsub("ave\\.expr\\.cluster(\\d{1,2})\\..+", "\\1", colnames(heat.vals2)), levels=c(10, 11, 3, 2, 1, 7, 5, 4, 6, 9, 8)),
+                               pheno[gsub("ave\\.expr\\.cluster\\d{1,2}\\.(.+)", "\\1", colnames(heat.vals2)), "Condition_full"])]
+
+pheatmap::pheatmap(heat.vals2,
+         scale="none",
+         cluster_cols = F, 
+         gaps_col =  cumsum(rle(gsub("ave\\.expr\\.cluster(\\d{1,2})\\..+", "\\1", colnames(heat.vals2)))$lengths),
+         color=colorRampPalette(rev(brewer.pal(n = 11, name = "RdBu")))(100),
+         border_color=NA,
+         breaks=seq(-max(abs(range(heat.vals2))), max(abs(range(heat.vals2))), length.out = 101),
+         annotation_col=data.frame(Cluster=factor(as.numeric(gsub("ave\\.expr\\.cluster(\\d{1,2})\\..+", "\\1", colnames(heat.vals2)))), 
+                                   Condition=as.character(pheno[gsub("ave\\.expr\\.cluster\\d{1,2}\\.(.+)", "\\1", colnames(heat.vals2)), "Condition"]),
+                                   Day=as.character(pheno[gsub("ave\\.expr\\.cluster\\d{1,2}\\.(.+)", "\\1", colnames(heat.vals2)), "Day"]),
+                                   row.names=colnames(heat.vals2)), 
+         show_colnames = F,
+         annotation_colors=list(Cluster=setNames(myPalette[1:11], 1:11),
+                                Condition=c(FluBI = "#3cb44b", MOG = "#f58231"), 
+                                Day=c(day7 = "#808080", day21 = "#98BFDB")),
+         labels_row=rowData(sce[top.markers,])$SYMBOL)
+
+## Figure S4A: Experiment 2
+pheno2 <- pheno
+row.names(pheno2) <- make.names(row.names(pheno2)) 
+heat.vals2 <- heat.vals[, pheno2[gsub("ave\\.expr\\.cluster\\d{1,2}\\.(.+)", "\\1", colnames(heat.vals)), "Condition_full"] %in% c("MOG_Brain", "MOG+CD40L_Brain", "WT+CD40L_Brain", "MOG_LN", "MOG+CD40L_LN", "WT+CD40L_LN")]
+## center and scale
+heat.vals2 <- (heat.vals2 - Matrix::rowMeans(heat.vals2)) / (apply(heat.vals2, 1, max) - apply(heat.vals2, 1, min))
+## reorder columns by Cluster/condition in logical order
+heat.vals2 <- heat.vals2[, order(factor(gsub("ave\\.expr\\.cluster(\\d{1,2})\\..+", "\\1", colnames(heat.vals2)), levels=c(10, 11, 3, 2, 1, 7, 5, 4, 6, 9, 8)),
+                                 pheno2[gsub("ave\\.expr\\.cluster\\d{1,2}\\.(.+)", "\\1", colnames(heat.vals2)), "Condition_full"])]
+
+pheatmap::pheatmap(heat.vals2,
+                   scale="none",
+                   cluster_cols = F, 
+                   gaps_col =  cumsum(rle(gsub("ave\\.expr\\.cluster(\\d{1,2})\\..+", "\\1", colnames(heat.vals2)))$lengths),
+                   color=colorRampPalette(rev(brewer.pal(n = 11, name = "RdBu")))(100),
+                   border_color=NA,
+                   breaks=seq(-max(abs(range(heat.vals2))), max(abs(range(heat.vals2))), length.out = 101),
+                   annotation_col=data.frame(Cluster=factor(as.numeric(gsub("ave\\.expr\\.cluster(\\d{1,2})\\..+", "\\1", colnames(heat.vals2)))), 
+                                             Condition=as.character(pheno2[gsub("ave\\.expr\\.cluster\\d{1,2}\\.(.+)", "\\1", colnames(heat.vals2)), "Condition"]), Tissue=as.character(pheno2[gsub("ave\\.expr\\.cluster\\d{1,2}\\.(.+)", "\\1", colnames(heat.vals2)), "Tissue"]),
+                                             row.names=colnames(heat.vals2)), 
+                   show_colnames = F,
+                   annotation_colors=list(Cluster=setNames(myPalette[1:11], 1:11),
+                                          Condition=c(MOG = "#f58231", `MOG+CD40L` = "#ffe119", `WT+CD40L` = "#F781BF"),
+                                          Tissue=setNames(myPalette[1:2], levels(factor(pheno2$Tissue)))
+                   ),
+                   labels_row=rowData(sce[top.markers,])$SYMBOL)
+```
