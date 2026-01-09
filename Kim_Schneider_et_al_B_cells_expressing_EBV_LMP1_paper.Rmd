@@ -60,6 +60,9 @@ trimMat <- function(x, trim=0.001) {
     x[x > hi] = hi
     x
 }
+
+## Save session info
+writeLines(capture.output(devtools::session_info()), "sessionInfo.txt")
 ```
 
 # Read-in dataset
@@ -287,7 +290,7 @@ y.ab <- DGEList(counts, samples= data.frame(row.names = colnames(counts),
 design <- model.matrix(~ 0 + Condition, data = y.ab$samples)
 colnames(design) <- gsub("Condition", "", colnames(design))
 y.ab <- estimateDisp(y.ab, design, trend="none")
-fit.ab <- glmQLFit(y.ab, design, robust=FALSE, abundance.trend=FALSE, legacy = TRUE)
+fit.ab <- glmQLFit(y.ab, design, robust=FALSE, abundance.trend=FALSE, legacy = FALSE)
 
 contrasts.matrix <- makeContrasts(
   day7   = MOG_day7 - FluBI_day7,
@@ -491,7 +494,7 @@ colnames(design) <- gsub("Condition", "", colnames(design))
 colnames(design) <- make.names(colnames(design)) 
 y.ab <- estimateDisp(y.ab, design, trend="none")
 summary(y.ab$common.dispersion)
-fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE, legacy = TRUE)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE, legacy = FALSE)
 contrasts.matrix <- makeContrasts(
   Effect_of_CD40L   = MOG.CD40L_Brain - MOG_Brain,
   levels=design
